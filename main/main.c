@@ -1,6 +1,6 @@
 #include "config.h" //Configuração do projeto
 
-#define BLE_STARTUP_WINDOW_MS (60 * 1000U)
+#define BLE_STARTUP_WINDOW_MS (30 * 1000U)
 #define HTTP_MUTEX_WAIT_MS 20000U
 #if (GTW_ROLE_TX_ONLY == 0)
 #define PATCH_BACKOFF_MIN_MS 2000U
@@ -60,6 +60,7 @@ typedef struct {
 
 #if (GTW_ROLE_RX_ONLY == 0)
 static SemaphoreHandle_t gtw_ack_mutex = NULL;
+static SemaphoreHandle_t ws_lifecycle_mutex = NULL;
 #endif
 static SemaphoreHandle_t gtw_request_mutex = NULL;
 #if (GTW_ROLE_TX_ONLY == 0)
@@ -73,6 +74,9 @@ static gtw_ack_wait_t gtw_ack_wait = {0};
 static gtw_rx_dup_t gtw_rx_dup_cache[GTW_RX_DUP_CACHE_SIZE] = {0};
 #endif
 static volatile int64_t gtw_last_lora_rx_ms = 0;
+static volatile bool gtw_lora_ready = false;
+static uint8_t gtw_lora_uart_error_streak = 0;
+static uint8_t gtw_lora_transaction_failures = 0;
 static volatile bool ble_config_mode_active = false;
 static volatile bool ble_startup_window_active = false;
 static TaskHandle_t ble_config_mode_task_handle = NULL;
@@ -99,7 +103,7 @@ static void tentar_conectar_wifi(void);
 
 void login_task(void *pvParameters);
 
-void start_token_timer();
+static bool start_token_timer(void);
 
 static void token_timer_cb(void *arg);
 
@@ -107,6 +111,9 @@ void ConnectRest();
 
 #if (GTW_ROLE_RX_ONLY == 0)
 void connect_to_websocket(void *pvParameters);
+static bool websocket_task_start_if_needed(void);
+static bool websocket_task_is_running(void);
+static bool websocket_is_connected(void);
 
 static void handle_bomba_control(cJSON *json);
 #endif
@@ -130,6 +137,7 @@ static void websocket_event_handler(void *arg, esp_event_base_t event_base, int3
 #endif
 
 static void lora_setup_gtw(void);
+static bool lora_apply_config_with_retries(int max_attempts, bool temporary);
 
 void gtw_lora_rx_task(void *pvParameters);
 static void gtw_lora_health_task(void *pvParameters);
@@ -235,8 +243,10 @@ void app_main(void) {
      * 3️⃣ Mutex
      ****************************************/
     MutexHTTP = xSemaphoreCreateMutex();
-    if (!MutexHTTP)
+    if (!MutexHTTP) {
         ESP_LOGE(TAG, "Falha ao criar MutexHTTP");
+        ConnectRest();
+    }
 
     MutexLora = xSemaphoreCreateMutex();
     if (!MutexLora) {
@@ -246,6 +256,7 @@ void app_main(void) {
 
 #if (GTW_ROLE_RX_ONLY == 0)
     gtw_ack_mutex = xSemaphoreCreateMutex();
+    ws_lifecycle_mutex = xSemaphoreCreateMutex();
 #endif
     gtw_request_mutex = xSemaphoreCreateMutex();
 #if (GTW_ROLE_TX_ONLY == 0)
@@ -253,7 +264,7 @@ void app_main(void) {
 #endif
     if (!gtw_request_mutex
 #if (GTW_ROLE_RX_ONLY == 0)
-        || !gtw_ack_mutex
+        || !gtw_ack_mutex || !ws_lifecycle_mutex
 #endif
 #if (GTW_ROLE_TX_ONLY == 0)
         || !patch_pool_mutex
@@ -273,6 +284,16 @@ void app_main(void) {
     load_PasswordGTW(passwordHTTPs, sizeof(passwordHTTPs));
     ID_GATEWAY = load_idGTW();
     DEVICE_ID = load_idUnidadeGTW();
+
+    if (DEVICE_ID > 0 && ID_GATEWAY != DEVICE_ID) {
+        ESP_LOGW(TAG, "IDs antigos divergentes (gateway=%d device=%d); usando DEVICE_ID=%d", ID_GATEWAY, DEVICE_ID,
+                 DEVICE_ID);
+        ID_GATEWAY = DEVICE_ID;
+        save_idGtw(ID_GATEWAY);
+    } else if (DEVICE_ID == 0 && ID_GATEWAY > 0) {
+        DEVICE_ID = ID_GATEWAY;
+        save_idUnidadeGtw(DEVICE_ID);
+    }
 
     // if (wifi_ssid[0] == '\0') {
     //     strncpy(wifi_ssid, "Acls_R", sizeof(wifi_ssid));
@@ -337,10 +358,10 @@ void app_main(void) {
         }
     }
 
-    if (nvs_resgatar_float(NVS_KEY_Fversion) > 0) // Verifica se há algum valor de firmware dentro do NVS
+    float firmware_salvo = nvs_resgatar_float(NVS_KEY_Fversion);
+    if (firmware_salvo > 0) // Verifica se há algum valor de firmware dentro do NVS
     {
-        Firmware_version =
-            nvs_resgatar_float(NVS_KEY_Fversion); // Se houver, salva o valor na variavel "Firmware_version"
+        Firmware_version = firmware_salvo;
         ESP_LOGI("NVS", ">>>>>>>>>>>>>>>>>>>>>> Firmware_version : %f", Firmware_version);
     }
 
@@ -350,13 +371,28 @@ void app_main(void) {
     ESP_LOGI(TAG, "Configurando LoRa...");
     lora_setup_gtw();
 
+    ESP_LOGI(TAG, "BLE aberto no boot por 30 segundos; Wi-Fi inicia depois da janela BLE");
+    ble_startup_window_active = true;
+
+    esp_err_t ble_start_err = bluetooth_config_start(BLE_STARTUP_WINDOW_MS);
+    if (ble_start_err != ESP_OK) {
+        ble_startup_window_active = false;
+        ESP_LOGE(TAG, "Falha ao abrir BLE no boot: %s; Wi-Fi sera iniciado", esp_err_to_name(ble_start_err));
+    } else if (xTaskCreate(ble_startup_window_task, "ble_boot_wait", 3072, NULL, 4, NULL) != pdPASS) {
+        ble_startup_window_active = false;
+        bluetooth_config_stop();
+        ESP_LOGE(TAG, "Falha ao criar task da janela BLE; Wi-Fi sera iniciado");
+    }
+
     /****************************************
      * 6️⃣ Tasks
      ****************************************/
     ESP_LOGI(TAG, "Criando tasks...");
 
-    if (xTaskCreate(wifi_task, "Conecta_Wifi", 4096, NULL, 5, &taskConecta_WIFI) != pdPASS)
+    if (xTaskCreate(wifi_task, "Conecta_Wifi", 4096, NULL, 5, &taskConecta_WIFI) != pdPASS) {
         ESP_LOGE(TAG, "Falha ao criar task WiFi");
+        ConnectRest();
+    }
 
     if (xTaskCreate(gtw_lora_rx_task, "gtw_lora_rx_task", 4096, NULL, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Falha ao criar task LoRa RX");
@@ -369,8 +405,10 @@ void app_main(void) {
     }
 
 #if (GTW_ROLE_RX_ONLY == 0)
-    if (xTaskCreate(ws_msg_processor_task, "ws_msg_proc", 9216, NULL, 4, NULL) != pdPASS)
+    if (xTaskCreate(ws_msg_processor_task, "ws_msg_proc", 9216, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Falha ao criar task WebSocket Processor");
+        ConnectRest();
+    }
 #else
     ESP_LOGW(TAG, "Modo RX_ONLY: WebSocket Processor desativado");
 #endif
@@ -382,11 +420,6 @@ void app_main(void) {
      * 7️⃣ Sistema inicializado
      ****************************************/
     ESP_LOGI(TAG, "Sistema inicializado com sucesso.");
-
-    ESP_LOGI(TAG, "BLE aberto no boot por 1 minuto; Wi-Fi inicia depois da janela BLE");
-    ble_startup_window_active = true;
-    bluetooth_config_start(BLE_STARTUP_WINDOW_MS);
-    xTaskCreate(ble_startup_window_task, "ble_boot_wait", 3072, NULL, 4, NULL);
 }
 
 static void tentar_conectar_wifi(void) {
@@ -395,7 +428,10 @@ static void tentar_conectar_wifi(void) {
         return;
     }
 
-    wifi_start_driver();
+    if (!wifi_start_driver()) {
+        ESP_LOGE(TAG, "Falha ao iniciar driver Wi-Fi");
+        return;
+    }
 
     if (usando_secundario && wifi_secundario) {
         ESP_LOGI(TAG, "Conectando ao Wi-Fi SECUNDÁRIO (%s)", WIFI_SECONDARY_SSID);
@@ -412,13 +448,15 @@ void wifi_task(void *pv) {
     tentar_conectar_wifi();
 
     static int falhas_wifi = 0;
+    static int falhas_ip = 0;
     static int falhas_internet = 0;
     static int ciclos_religar = 0;
+    int64_t inicio_falha_internet_ms = 0;
     int wifi_4G = 0;
 
     while (1) {
         esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(10000)); // verificação a cada 10s
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(WIFI_MONITOR_INTERVAL_MS));
 
         if (ble_config_mode_active || ble_startup_window_active) {
             if (wifi_is_active()) {
@@ -426,31 +464,83 @@ void wifi_task(void *pv) {
                 wifi_stop_driver();
             }
             Connectado = 0;
-            TokenOk = 0;
             continue;
         }
 
         if (!wifi_is_active()) {
             ESP_LOGW(TAG, "Driver Wi-Fi inativo — reiniciando driver...");
             tentar_conectar_wifi();
-            falhas_wifi = 0;
+
+            if (!wifi_is_active()) {
+                ciclos_religar++;
+                ESP_LOGE(TAG, "Driver Wi-Fi nao iniciou (%d/%d)", ciclos_religar, WIFI_CYCLE_MAX_RETRIES);
+                if (ciclos_religar >= WIFI_CYCLE_MAX_RETRIES) {
+                    ESP_LOGE(TAG, "Driver Wi-Fi permaneceu inativo; reiniciando ESP32");
+                    esp_restart();
+                }
+            } else {
+                falhas_wifi = 0;
+            }
             continue;
         }
 
         // === Está conectado ao AP? ===
         if (wifi_sta_connected()) {
-            if (wifi_check_internet(INTERNET_CHECK_TIMEOUT_MS)) {
+            falhas_wifi = 0;
+
+            if (!wifi_sta_has_ip()) {
+                Connectado = 0;
                 falhas_internet = 0;
-                falhas_wifi = 0;
-                ciclos_religar = 0;
-                ESP_LOGI(TAG, "Conectado e com internet!");
+                inicio_falha_internet_ms = 0;
+                falhas_ip++;
+                ESP_LOGW(TAG, "Associado ao roteador, mas sem IP (%d/%d)", falhas_ip, WIFI_IP_MAX_FAILS);
 
-                if (Connectado == 0) {
-                    Connectado = 1;
+                if (falhas_ip >= WIFI_IP_MAX_FAILS) {
+                    ESP_LOGW(TAG, "Sem IP por 60 segundos; reiniciando driver Wi-Fi");
+                    wifi_stop_driver();
+                    vTaskDelay(pdMS_TO_TICKS(WIFI_DRIVER_RESTART_DELAY_MS));
 
-                    if (Task_login_task == NULL) {
-                        xTaskCreate(login_task, "login_task", 1024 * 8, NULL, 5, &Task_login_task);
-                        start_token_timer();
+                    if (wifi_secundario)
+                        usando_secundario = !usando_secundario;
+
+                    tentar_conectar_wifi();
+                    falhas_ip = 0;
+                    ciclos_religar++;
+                    if (ciclos_religar >= WIFI_CYCLE_MAX_RETRIES) {
+                        ESP_LOGE(TAG, "Sem IP apos %d ciclos; reiniciando ESP32", ciclos_religar);
+                        esp_restart();
+                    }
+                }
+                continue;
+            }
+
+            falhas_ip = 0;
+            ciclos_religar = 0;
+
+            bool internet_disponivel = false;
+
+#if (GTW_ROLE_RX_ONLY == 0)
+            internet_disponivel = websocket_is_connected();
+#endif
+
+            if (!internet_disponivel) {
+                internet_disponivel = wifi_check_internet(INTERNET_CHECK_TIMEOUT_MS);
+            }
+
+            if (internet_disponivel) {
+                Connectado = 1;
+                falhas_internet = 0;
+                inicio_falha_internet_ms = 0;
+#if DEBUG_MODE
+                ESP_LOGI(TAG, "Wi-Fi conectado e internet disponivel");
+#endif
+
+                if (Task_login_task == NULL) {
+                    if (xTaskCreate(login_task, "login_task", 1024 * 8, NULL, 5, &Task_login_task) == pdPASS) {
+                        ESP_LOGI(TAG, "Task de login criada; timer inicia apos receber o primeiro token");
+                    } else {
+                        Task_login_task = NULL;
+                        ESP_LOGE(TAG, "Falha ao criar task de login");
                     }
                 }
 
@@ -462,15 +552,21 @@ void wifi_task(void *pv) {
             } else {
                 Connectado = 0;
                 falhas_internet++;
-                ESP_LOGW(TAG, "Wi-Fi associado, mas backend indisponivel (%d/%d)", falhas_internet,
-                         WIFI_INTERNET_MAX_FAILS);
+                int64_t agora_ms = esp_timer_get_time() / 1000;
+                if (inicio_falha_internet_ms == 0)
+                    inicio_falha_internet_ms = agora_ms;
 
-                if (falhas_internet >= WIFI_INTERNET_MAX_FAILS) {
+                uint32_t sem_internet_ms = (uint32_t)(agora_ms - inicio_falha_internet_ms);
+                ESP_LOGW(TAG, "Wi-Fi associado, mas sem internet ha %lu s (falha %d)",
+                         (unsigned long)(sem_internet_ms / 1000U), falhas_internet);
+
+                if (sem_internet_ms >= WIFI_INTERNET_RESTART_DELAY_MS) {
+                    ESP_LOGW(TAG, "Sem internet por 30 minutos; reiniciando somente o driver Wi-Fi");
                     falhas_internet = 0;
-                    ciclos_religar++;
+                    inicio_falha_internet_ms = 0;
 
                     wifi_stop_driver();
-                    vTaskDelay(pdMS_TO_TICKS(WIFI_OFF_DELAY_MS));
+                    vTaskDelay(pdMS_TO_TICKS(WIFI_DRIVER_RESTART_DELAY_MS));
 
                     if (wifi_secundario) {
                         usando_secundario = !usando_secundario;
@@ -485,15 +581,23 @@ void wifi_task(void *pv) {
         } else {
             // Não conectado ao AP
             Connectado = 0;
+            falhas_ip = 0;
+            falhas_internet = 0;
+            inicio_falha_internet_ms = 0;
             falhas_wifi++;
             ESP_LOGW(TAG, "Wi-Fi desconectado (%d/%d)", falhas_wifi, WIFI_CONNECT_MAX_FAILS);
+
+            if (falhas_wifi < WIFI_CONNECT_MAX_FAILS) {
+                tentar_conectar_wifi();
+                continue;
+            }
 
             if (falhas_wifi >= WIFI_CONNECT_MAX_FAILS) {
                 ESP_LOGE(TAG, "Falhou reconexão Wi-Fi — reiniciando ciclo");
 
                 wifi_stop_driver();
 
-                vTaskDelay(pdMS_TO_TICKS(WIFI_OFF_DELAY_MS));
+                vTaskDelay(pdMS_TO_TICKS(WIFI_DRIVER_RESTART_DELAY_MS));
 
                 if (wifi_secundario)
                     usando_secundario = !usando_secundario;
@@ -514,115 +618,149 @@ void wifi_task(void *pv) {
 
 // Callback do timer: notifica a task
 static void token_timer_cb(void *arg) {
-    if (Task_login_task != NULL)
+    if (Task_login_task != NULL) {
         xTaskNotify(Task_login_task, 1, eSetValueWithOverwrite);
+    }
 }
 
-// Função que cria o timer (chame uma vez na init, antes de rodar as tasks)
-void start_token_timer() {
-    const esp_timer_create_args_t timer_args = {
-        .callback = &token_timer_cb, .arg = NULL, .dispatch_method = ESP_TIMER_TASK, .name = "token_timer"};
-    esp_timer_create(&timer_args, &token_timer);
-    // 20h em microssegundos = 72.000.000.000
-    esp_timer_start_periodic(token_timer, 20ULL * 3600ULL * 1000000ULL);
-    // esp_timer_start_periodic(token_timer, 120ULL * 1000000ULL);
+static bool start_token_timer(void) {
+    if (token_timer == NULL) {
+        const esp_timer_create_args_t timer_args = {
+            .callback = &token_timer_cb, .arg = NULL, .dispatch_method = ESP_TIMER_TASK, .name = "token_timer"};
+
+        esp_err_t create_err = esp_timer_create(&timer_args, &token_timer);
+        if (create_err != ESP_OK) {
+            ESP_LOGE(TAG, "Falha ao criar timer do token: %s", esp_err_to_name(create_err));
+            token_timer = NULL;
+            return false;
+        }
+    } else {
+        esp_err_t stop_err = esp_timer_stop(token_timer);
+        if (stop_err != ESP_OK && stop_err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Falha ao parar timer anterior do token: %s", esp_err_to_name(stop_err));
+        }
+    }
+
+    esp_err_t start_err = esp_timer_start_once(token_timer, 20ULL * 3600ULL * 1000000ULL);
+    if (start_err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao iniciar timer de renovacao do token: %s", esp_err_to_name(start_err));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Proxima renovacao do token agendada para daqui a 20 horas");
+    return true;
 }
 
 void login_task(void *pvParameters) {
 
     Task_login_task = xTaskGetCurrentTaskHandle(); // salva o handle
-
-    int taskInit = 0;
-    char mensagemRST[100];
+    esp_task_wdt_add(NULL);
 
     while (1) {
+        esp_task_wdt_reset();
+#if DEBUG_MODE
         UBaseType_t stack_remain = uxTaskGetStackHighWaterMark(NULL);
         ESP_LOGI("STACK", "\033[1;35m*** Task [%s] - mínimo livre: %u words (~%u bytes) ***\033[0m",
                  pcTaskGetName(NULL), stack_remain, stack_remain * sizeof(StackType_t));
-
-        TokenOk = 0;
-
-        if (verifica_conexao_internet()) {
-            if (Connectado == 0) {
-                Connectado = 1;
-            }
-
-            bool login_ok = false;
-            if (MutexHTTP == NULL) {
-                ESP_LOGW(TAG, "MutexHTTP nulo; login sem mutex");
-                login_ok = fazer_login(userNameHTTPs, passwordHTTPs);
-            } else if (xSemaphoreTake(MutexHTTP, pdMS_TO_TICKS(HTTP_MUTEX_WAIT_MS)) == pdTRUE) {
-                login_ok = fazer_login(userNameHTTPs, passwordHTTPs);
-                xSemaphoreGive(MutexHTTP);
-            } else {
-                ESP_LOGW(TAG, "Login aguardando HTTP livre; MutexHTTP ocupado");
-            }
-
-            if (login_ok) {
-                ESP_LOGI(TAG, "Login bem-sucedido. Token");
-                TokenOk = 1;
-
-                if (taskInit == 0) {
-                    esp_reset_reason_t reset_reason = esp_reset_reason();
-                    taskInit = 1;
-                    // atualizacao_OTA();
-
-                    // snprintf(mensagemRST, sizeof(mensagemRST), "Motivo do último reset: %s ",
-                    // reset_reason_str(reset_reason)); alertApiEvents(mensagemRST); alertApiEvents("O Connect
-                    // estabeleceu conexão com a rede.");
-                }
-
-#if (GTW_ROLE_RX_ONLY == 0)
-                if (taskConnect_to_websocket == NULL) {
-                    xTaskCreate(connect_to_websocket, "connect_to_websocket", 2048 * 6, NULL, 5,
-                                &taskConnect_to_websocket);
-                } else {
-                    ESP_LOGW(TAG, "Task de WebSocket já está em execução.");
-                    stop_websocket_task = true;
-                    vTaskDelay(pdMS_TO_TICKS(15000));
-#if DEBUG_MODE
-                    ESP_LOGE("Login", "Reiniciando a task de WebSocket...\n");
 #endif
 
-                    if (taskConnect_to_websocket == NULL) {
-                        xTaskCreate(connect_to_websocket, "connect_to_websocket", 2048 * 6, NULL, 5,
-                                    &taskConnect_to_websocket);
+        if (!wifi_sta_connected() || !wifi_sta_has_ip() || Connectado != 1) {
+            ESP_LOGI(TAG, "Aguardando internet para obter ou renovar o token...");
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            continue;
+        }
+
+        bool login_ok = false;
+        if (MutexHTTP == NULL) {
+            ESP_LOGW(TAG, "MutexHTTP nulo; login sem mutex");
+            login_ok = fazer_login(userNameHTTPs, passwordHTTPs);
+        } else if (xSemaphoreTake(MutexHTTP, pdMS_TO_TICKS(HTTP_MUTEX_WAIT_MS)) == pdTRUE) {
+            login_ok = fazer_login(userNameHTTPs, passwordHTTPs);
+            xSemaphoreGive(MutexHTTP);
+        } else {
+            ESP_LOGW(TAG, "Login aguardando HTTP livre; MutexHTTP ocupado");
+        }
+        esp_task_wdt_reset();
+
+        if (login_ok) {
+            ESP_LOGI(TAG, "Login bem-sucedido; token novo confirmado");
+            TokenOk = 1;
+
+#if (GTW_ROLE_RX_ONLY == 0)
+            if (!websocket_task_is_running()) {
+                if (!websocket_task_start_if_needed()) {
+                    ESP_LOGE(TAG, "Falha ao criar task do WebSocket");
+                }
+            } else {
+                ESP_LOGW(TAG, "Task de WebSocket já está em execução.");
+                stop_websocket_task = true;
+                for (int i = 0; i < 400 && websocket_task_is_running(); i++) {
+                    if ((i % 100) == 0)
+                        esp_task_wdt_reset();
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+#if DEBUG_MODE
+                ESP_LOGE("Login", "Reiniciando a task de WebSocket...\n");
+#endif
+
+                if (!websocket_task_is_running()) {
+                    if (!websocket_task_start_if_needed()) {
+                        ESP_LOGE(TAG, "Falha ao recriar task do WebSocket");
                     }
                 }
+            }
 
-                // Em vez de delay de 20h → espera notificação do timer
+            // Em vez de delay de 20h → espera notificação do timer
 #else
-                ESP_LOGI(TAG, "Modo RX_ONLY: WebSocket desativado; login mantido para PATCH");
+            ESP_LOGI(TAG, "Modo RX_ONLY: WebSocket desativado; login mantido para PATCH");
 #endif
 
 #if (GTW_ROLE_TX_ONLY == 0)
-                if (task_patch == NULL) {
+            if (task_patch == NULL) {
 #if (GTW_ROLE_RX_ONLY == 0)
-                    for (int i = 0; i < 80 && taskConnect_to_websocket != NULL; i++) {
-                        if (ws_client != NULL && esp_websocket_client_is_connected(ws_client)) {
-                            break;
-                        }
-                        vTaskDelay(pdMS_TO_TICKS(100));
+                for (int i = 0; i < 80 && taskConnect_to_websocket != NULL; i++) {
+                    if (ws_client != NULL && esp_websocket_client_is_connected(ws_client)) {
+                        break;
                     }
-
-#endif
-                    xTaskCreate(patch_task, "patch_task", 1024 * 8, NULL, 5, &task_patch);
+                    vTaskDelay(pdMS_TO_TICKS(100));
                 }
+
+#endif
+                xTaskCreate(patch_task, "patch_task", 1024 * 8, NULL, 5, &task_patch);
+            }
 #else
-                ESP_LOGI(TAG, "Modo TX_ONLY: patch_task desativada");
+            ESP_LOGI(TAG, "Modo TX_ONLY: patch_task desativada");
 #endif
 
-                uint32_t notified;
-                xTaskNotifyWait(0, UINT32_MAX, &notified, portMAX_DELAY);
-                ESP_LOGI(TAG, "20h passaram → renovando token...");
-                continue;
-            } else {
-                ESP_LOGW(TAG, "Login falhou, tentando novamente em 30s.");
-                vTaskDelay(pdMS_TO_TICKS(30000)); // 30s
+            bool refresh_requested_while_scheduling = false;
+            while (!start_token_timer()) {
+                ESP_LOGW(TAG, "Timer do token indisponivel; novo agendamento em 30s");
+
+                uint32_t notified_while_scheduling = 0;
+                if (xTaskNotifyWait(0, UINT32_MAX, &notified_while_scheduling, pdMS_TO_TICKS(30000)) == pdTRUE) {
+                    ESP_LOGW(TAG, "Renovacao antecipada do token solicitada");
+                    refresh_requested_while_scheduling = true;
+                    break;
+                }
+                esp_task_wdt_reset();
             }
+
+            if (!refresh_requested_while_scheduling) {
+                uint32_t notified;
+                while (xTaskNotifyWait(0, UINT32_MAX, &notified, pdMS_TO_TICKS(30000)) != pdTRUE)
+                    esp_task_wdt_reset();
+            }
+
+            ESP_LOGI(TAG, "Renovacao solicitada; token e WebSocket atuais permanecem ativos");
+            continue;
         } else {
-            ESP_LOGI(TAG, "Aguardando Wi-Fi e internet...");
-            vTaskDelay(pdMS_TO_TICKS(10000)); // 10s
+            if (TokenOk == 1 && token_global[0] != '\0') {
+                ESP_LOGW(TAG, "Renovacao falhou; token anterior mantido. Nova tentativa em 30s");
+            } else {
+                ESP_LOGW(TAG, "Login falhou; nova tentativa em 30s");
+            }
+            esp_task_wdt_reset();
+            vTaskDelay(pdMS_TO_TICKS(30000)); // 30s
         }
     }
 }
@@ -631,96 +769,152 @@ void login_task(void *pvParameters) {
 
 // Função principal da tarefa de conexão WebSocket
 #if (GTW_ROLE_RX_ONLY == 0)
+static bool websocket_task_is_running(void) {
+    if (!ws_lifecycle_mutex || xSemaphoreTake(ws_lifecycle_mutex, pdMS_TO_TICKS(1000)) != pdTRUE)
+        return true;
+
+    bool running = taskConnect_to_websocket != NULL;
+    xSemaphoreGive(ws_lifecycle_mutex);
+    return running;
+}
+
+static bool websocket_is_connected(void) {
+    if (!ws_lifecycle_mutex || xSemaphoreTake(ws_lifecycle_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+        return false;
+
+    bool connected = ws_client != NULL && esp_websocket_client_is_connected(ws_client);
+    xSemaphoreGive(ws_lifecycle_mutex);
+    return connected;
+}
+
+static bool websocket_task_start_if_needed(void) {
+    if (TokenOk != 1 || token_global[0] == '\0' || !wifi_sta_connected() || !wifi_sta_has_ip())
+        return false;
+
+    if (!ws_lifecycle_mutex || xSemaphoreTake(ws_lifecycle_mutex, pdMS_TO_TICKS(2000)) != pdTRUE)
+        return false;
+
+    bool ok = true;
+    if (taskConnect_to_websocket == NULL) {
+        stop_websocket_task = false;
+        if (xTaskCreate(connect_to_websocket, "connect_to_websocket", 2048 * 6, NULL, 5, &taskConnect_to_websocket) !=
+            pdPASS) {
+            taskConnect_to_websocket = NULL;
+            ok = false;
+        }
+    }
+
+    xSemaphoreGive(ws_lifecycle_mutex);
+    return ok;
+}
+
 void connect_to_websocket(void *pvParameters) {
 
     static char tmp[900];
-    stop_websocket_task = false;
-
-    // snprintf(tmp, sizeof(tmp), "wss://jalles.aclsconnect.com/ws-native/native-ws?token=%s", token_global);
-    snprintf(tmp, sizeof(tmp), "wss://83cd1aa837661fab941b2c5a2a65424b.jm.net.br:2087/ws-native/native-ws?token=%s",
-             token_global);
-    // snprintf(tmp, sizeof(tmp), "ws://192.168.1.111:8017/native-ws?token=%s", token_global);
-
-    // Duplica pra heap (memória estável)
-    websocket_url = strdup(tmp);
-
-    if (!websocket_url) {
-        ESP_LOGE("WS", "Sem memória pra URL do websocket");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    esp_websocket_client_config_t websocket_cfg = {
-        .uri = websocket_url,
-        .cert_pem = rootCaCerticate,
-        .reconnect_timeout_ms = 5000,
-        .network_timeout_ms = 30000,
-        // .keep_alive_enable = true,
-        // .disable_auto_reconnect = false,
-        // .ping_interval_sec = 10,
-        // .pingpong_timeout_sec = 5,
-    };
-
-    // esp_websocket_client_handle_t websocket_client = esp_websocket_client_init(&websocket_cfg);
-
-    ws_client = esp_websocket_client_init(&websocket_cfg);
-
-    if (ws_client == NULL) {
-        ESP_LOGE(TAG, "Falha ao inicializar o cliente WebSocket");
-        if (websocket_url) {
-            free(websocket_url);
-            websocket_url = NULL;
-        }
-        taskConnect_to_websocket = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, (void *)ws_msg_queue);
-
-    if (esp_websocket_client_start(ws_client) != ESP_OK) {
-        ESP_LOGE(TAG, "Erro ao iniciar o cliente WebSocket");
-        esp_websocket_client_destroy(ws_client);
-        ws_client = NULL;
-        if (websocket_url) {
-            free(websocket_url);
-            websocket_url = NULL;
-        }
-        taskConnect_to_websocket = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "Tentando conectar ao WebSocket...");
-    int reconnect_attempts = 0;
+    esp_task_wdt_add(NULL);
 
     while (!stop_websocket_task) {
-        if (!esp_websocket_client_is_connected(ws_client)) {
-            if (reconnect_attempts < MAX_RECONNECT_ATTEMPTS) {
-                reconnect_attempts++;
-                ESP_LOGW(TAG, "Tentando reconectar ao WebSocket... Tentativa %d", reconnect_attempts);
-                vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_task_wdt_reset();
+        // Com token valido, continua tentando mesmo se o teste externo do Google falhar temporariamente.
+        if (TokenOk != 1 || token_global[0] == '\0' || !wifi_sta_connected() || !wifi_sta_has_ip()) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        snprintf(tmp, sizeof(tmp), "wss://" API_HOST ":" API_PORT "/ws-native/native-ws?token=%s", token_global);
+        char *local_url = strdup(tmp);
+
+        if (!local_url) {
+            ESP_LOGE("WS", "Sem memoria para a URL do WebSocket; nova tentativa em 5s");
+            vTaskDelay(pdMS_TO_TICKS(WS_RETRY_DELAY_MS));
+            continue;
+        }
+
+        esp_websocket_client_config_t websocket_cfg = {
+            .uri = local_url,
+            .cert_pem = rootCaCerticate,
+            .reconnect_timeout_ms = 5000,
+            .network_timeout_ms = 30000,
+            .disable_auto_reconnect = false,
+        };
+
+        esp_websocket_client_handle_t local_client = esp_websocket_client_init(&websocket_cfg);
+        if (local_client == NULL) {
+            ESP_LOGE(TAG, "Falha ao inicializar WebSocket; nova tentativa em 5s");
+            free(local_url);
+            vTaskDelay(pdMS_TO_TICKS(WS_RETRY_DELAY_MS));
+            continue;
+        }
+
+        esp_err_t event_err = esp_websocket_register_events(local_client, WEBSOCKET_EVENT_ANY, websocket_event_handler,
+                                                            (void *)ws_msg_queue);
+        if (event_err != ESP_OK) {
+            ESP_LOGE(TAG, "Falha ao registrar eventos WebSocket: %s", esp_err_to_name(event_err));
+            esp_websocket_client_destroy(local_client);
+            free(local_url);
+            vTaskDelay(pdMS_TO_TICKS(WS_RETRY_DELAY_MS));
+            continue;
+        }
+
+        xSemaphoreTake(ws_lifecycle_mutex, portMAX_DELAY);
+        ws_client = local_client;
+        websocket_url = local_url;
+        xSemaphoreGive(ws_lifecycle_mutex);
+
+        esp_err_t start_err = esp_websocket_client_start(local_client);
+        if (start_err != ESP_OK) {
+            ESP_LOGE(TAG, "Erro ao iniciar WebSocket: %s; nova tentativa em 5s", esp_err_to_name(start_err));
+            xSemaphoreTake(ws_lifecycle_mutex, portMAX_DELAY);
+            ws_client = NULL;
+            websocket_url = NULL;
+            xSemaphoreGive(ws_lifecycle_mutex);
+            esp_websocket_client_destroy(local_client);
+            free(local_url);
+            vTaskDelay(pdMS_TO_TICKS(WS_RETRY_DELAY_MS));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Cliente WebSocket iniciado; aguardando conexao...");
+        uint32_t disconnected_log_ms = 0;
+
+        while (!stop_websocket_task) {
+            esp_task_wdt_reset();
+            if (esp_websocket_client_is_connected(local_client)) {
+                disconnected_log_ms = 0;
             } else {
-                ESP_LOGE(TAG, "Máximo de tentativas de reconexão atingido. Finalizando...");
-                break;
+                disconnected_log_ms += 1000U;
+
+                if (disconnected_log_ms >= WS_RETRY_DELAY_MS) {
+                    ESP_LOGW(TAG, "WebSocket desconectado; reconexao automatica continua ativa");
+                    disconnected_log_ms = 0;
+                }
             }
-        } else {
-            reconnect_attempts = 0;
+
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
+
+        ESP_LOGI(TAG, "Encerrando instancia atual do WebSocket...");
+        xSemaphoreTake(ws_lifecycle_mutex, portMAX_DELAY);
+        esp_websocket_client_stop(local_client);
+        esp_websocket_client_destroy(local_client);
+        if (ws_client == local_client)
+            ws_client = NULL;
+        if (websocket_url == local_url)
+            websocket_url = NULL;
+        xSemaphoreGive(ws_lifecycle_mutex);
+
+        free(local_url);
+
+        if (!stop_websocket_task) {
+            vTaskDelay(pdMS_TO_TICKS(WS_RETRY_DELAY_MS));
+        }
     }
-    ESP_LOGI(TAG, "Encerrando WebSocket...");
 
-    esp_websocket_client_stop(ws_client);
-    esp_websocket_client_destroy(ws_client);
-    ws_client = NULL;
-
-    if (websocket_url) {
-        free(websocket_url);
-        websocket_url = NULL;
-    }
-
+    ESP_LOGI(TAG, "Task WebSocket encerrada por solicitacao");
+    xSemaphoreTake(ws_lifecycle_mutex, portMAX_DELAY);
     taskConnect_to_websocket = NULL;
+    xSemaphoreGive(ws_lifecycle_mutex);
+    esp_task_wdt_delete(NULL);
     vTaskDelete(NULL);
 }
 
@@ -740,14 +934,15 @@ static void websocket_event_handler(void *arg, esp_event_base_t event_base, int3
 
     case WEBSOCKET_EVENT_DISCONNECTED:
 #if DEBUG_MODE
-        ESP_LOGI(TAG_Websocket, "WebSocket desconectado");
+        ESP_LOGW(TAG_Websocket, "WebSocket desconectado; reconexao automatica mantida");
 #endif
-        stop_websocket_task = true;
         break;
 
     case WEBSOCKET_EVENT_DATA:
         if (data->op_code == 0x1) {
+#if DEBUG_MODE
             ESP_LOGI("Websoket", "______________________mensagem\n");
+#endif
             // texto
             if (data->data_len == 0 || data->data_len >= WS_MSG_MAX_LEN) {
 #if DEBUG_MODE
@@ -789,7 +984,9 @@ static void websocket_event_handler(void *arg, esp_event_base_t event_base, int3
 
 static void ws_msg_processor_task(void *pv) {
     ws_msg_item_t item;
+    esp_task_wdt_add(NULL);
     while (1) {
+        esp_task_wdt_reset();
         if (xQueueReceive(ws_msg_queue, &item, pdMS_TO_TICKS(2000)) == pdTRUE) {
 
 #if DEBUG_MODE
@@ -840,10 +1037,6 @@ static void ws_msg_processor_task(void *pv) {
     vTaskDelete(NULL);
 }
 
-static bool gtw_tx_can_send_lora_from_ws(void) {
-    return Connectado == 1 && TokenOk == 1 && ws_client != NULL && esp_websocket_client_is_connected(ws_client);
-}
-
 static void handle_bomba_control(cJSON *json) {
 
     cJSON *data_obj = cJSON_GetObjectItemCaseSensitive(json, "data");
@@ -862,10 +1055,23 @@ static void handle_bomba_control(cJSON *json) {
     cJSON *tanqueId = cJSON_GetObjectItemCaseSensitive(data_obj, "tanqueId");
     cJSON *vazao = cJSON_GetObjectItemCaseSensitive(data_obj, "vazao");
 
-    if (!cJSON_IsNumber(idBomba) || !cJSON_IsBool(comando) || !cJSON_IsNumber(status) || !cJSON_IsNumber(gtwId) ||
-        !cJSON_IsNumber(tanqueId)) {
+    bool status_valido = cJSON_IsNumber(status) && (status->valuedouble == 0.0 || status->valuedouble == 1.0);
+    bool ids_validos = cJSON_IsNumber(idBomba) && idBomba->valuedouble > 0.0 && idBomba->valuedouble <= UINT16_MAX &&
+                       idBomba->valuedouble == (double)idBomba->valueint && cJSON_IsNumber(tanqueId) &&
+                       tanqueId->valuedouble > 0.0 && tanqueId->valuedouble <= UINT16_MAX &&
+                       tanqueId->valuedouble == (double)tanqueId->valueint && cJSON_IsNumber(gtwId) &&
+                       gtwId->valuedouble > 0.0 && gtwId->valuedouble == (double)gtwId->valueint;
+    bool tem_vazao = cJSON_IsNumber(vazao);
+    bool vazao_valida =
+        tem_vazao && isfinite(vazao->valuedouble) && vazao->valuedouble >= 0.0 && vazao->valuedouble <= 100.0;
+    bool executar_comando = cJSON_IsBool(comando) && cJSON_IsTrue(comando);
+
+    if (!ids_validos || !cJSON_IsBool(comando) || !status_valido ||
+        ((vazao != NULL && !cJSON_IsNull(vazao)) && !vazao_valida) || (!executar_comando && !vazao_valida)) {
 #if DEBUG_MODE
-        ESP_LOGE(TAG_Websocket, "Campos 'bombaId' ou 'comando' ausentes/inválidos");
+        ESP_LOGE(TAG_Websocket,
+                 "Comando descartado: IDs/comando/status/vazao ausentes ou invalidos (bomba=%d tanque=%d)",
+                 cJSON_IsNumber(idBomba) ? idBomba->valueint : -1, cJSON_IsNumber(tanqueId) ? tanqueId->valueint : -1);
 #endif
         return;
     }
@@ -877,14 +1083,8 @@ static void handle_bomba_control(cJSON *json) {
         return;
     }
 
-    if (!gtw_tx_can_send_lora_from_ws()) {
-        ESP_LOGW(TAG_Websocket, "Comando ignorado: internet/token/websocket nao estao prontos");
-        return;
-    }
-
-    // se vazao não vier, usa 0
     float valor_vazao = 0.0f;
-    if (vazao && cJSON_IsNumber(vazao)) {
+    if (vazao_valida) {
         valor_vazao = (float)vazao->valuedouble;
     }
     int controle_id = cJSON_IsNumber(idControle) ? idControle->valueint : idBomba->valueint;
@@ -893,7 +1093,7 @@ static void handle_bomba_control(cJSON *json) {
              status->valueint ? "DESLIGAR" : "LIGAR");
     ESP_LOGI(TAG_Websocket, "Para tanque ID %d via gateway ID %d", tanqueId->valueint, gtwId->valueint);
 
-    char URL_OTA[80];
+    char URL_OTA[96];
 
     if (cJSON_IsNumber(tanqueId)) {
         int id = tanqueId->valueint;
@@ -935,28 +1135,30 @@ static void handle_bomba_control(cJSON *json) {
 
         if (json_buffer != NULL) {
             if (!enviar_lora) {
+#if DEBUG_MODE
                 ESP_LOGI("Comando Web", "Json recebido: %s", json_buffer);
+#endif
             }
             free(json_buffer);
             json_buffer = NULL;
         }
 
         if (Json_GTW != NULL) {
-        cJSON *online = cJSON_GetObjectItemCaseSensitive(Json_GTW, "online");
+            cJSON *online = cJSON_GetObjectItemCaseSensitive(Json_GTW, "online");
 
-        if (online && cJSON_IsBool(online)) {
+            if (online && cJSON_IsBool(online)) {
 
-            if (cJSON_IsTrue(online)) {
-                ESP_LOGI("Comando Web", "Tanque ONLINE");
-                // coloque sua lógica para online aqui
+                if (cJSON_IsTrue(online)) {
+                    ESP_LOGI("Comando Web", "Tanque ONLINE");
+                    // coloque sua lógica para online aqui
+                } else {
+                    ESP_LOGW("Comando Web", "Tanque OFFLINE");
+                    // coloque sua lógica para offline aqui
+                    enviar_lora = true;
+                }
             } else {
-                ESP_LOGW("Comando Web", "Tanque OFFLINE");
-                // coloque sua lógica para offline aqui
-                enviar_lora = true;
+                ESP_LOGE("Comando Web", "Campo 'online' inválido ou inexistente");
             }
-        } else {
-            ESP_LOGE("Comando Web", "Campo 'online' inválido ou inexistente");
-        }
         }
 
         if (Json_GTW != NULL && !enviar_lora) {
@@ -970,9 +1172,23 @@ static void handle_bomba_control(cJSON *json) {
 
         if (enviar_lora) {
             char msg[64];
-            snprintf(msg, sizeof(msg), "{\"s\":%d,\"v\":%.2f,\"c\":%d}", status->valueint, valor_vazao,
-                     controle_id);
-            gtw_send_to_tank(tanqueId->valueint, msg, idBomba->valueint);
+            int msg_len;
+            if (vazao_valida) {
+                msg_len = snprintf(msg, sizeof(msg), "{\"s\":%d,\"v\":%.2f,\"c\":%d,\"q\":%d}", status->valueint,
+                                   valor_vazao, controle_id, executar_comando ? 1 : 0);
+            } else {
+                msg_len = snprintf(msg, sizeof(msg), "{\"s\":%d,\"c\":%d,\"q\":%d}", status->valueint, controle_id,
+                                   executar_comando ? 1 : 0);
+            }
+
+            if (msg_len < 0 || msg_len >= (int)sizeof(msg)) {
+                ESP_LOGE("Comando Web", "Comando LoRa excedeu o buffer e foi descartado");
+                return;
+            }
+
+            bool lora_ok = gtw_send_to_tank(tanqueId->valueint, msg, idBomba->valueint);
+            ESP_LOGI("Comando Web", "Resultado LoRa tanque %d: %s", tanqueId->valueint,
+                     lora_ok ? "ACK recebido" : "sem ACK");
         }
     }
 }
@@ -1004,11 +1220,6 @@ static void handle_PingTanque(cJSON *json) {
 #if DEBUG_MODE
         ESP_LOGW(TAG_Websocket, "Ping ignorado: destino GTW=%d, este GTW=%d", gtwId->valueint, DEVICE_ID);
 #endif
-        return;
-    }
-
-    if (!gtw_tx_can_send_lora_from_ws()) {
-        ESP_LOGW(TAG_Websocket, "Ping ignorado: internet/token/websocket nao estao prontos");
         return;
     }
 
@@ -1053,23 +1264,32 @@ static void handle_BTOn(cJSON *json) {
         return;
     }
 
-    ESP_LOGI(TAG_Websocket, "BLE aberto por 1 minuto para configuracao");
+    ESP_LOGI(TAG_Websocket, "BLE aberto por 30 segundos para configuracao");
 }
 
 bool ws_send_json(const char *json_msg) {
-    if (!ws_client) {
-        ESP_LOGE("WS", "WebSocket client NULL");
+    if (!json_msg || !ws_lifecycle_mutex || xSemaphoreTake(ws_lifecycle_mutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
+        ESP_LOGE("WS", "WebSocket ocupado ou mensagem invalida");
         return false;
     }
 
-    if (!esp_websocket_client_is_connected(ws_client)) {
+    esp_websocket_client_handle_t client = ws_client;
+    if (!client) {
+        ESP_LOGE("WS", "WebSocket client NULL");
+        xSemaphoreGive(ws_lifecycle_mutex);
+        return false;
+    }
+
+    if (!esp_websocket_client_is_connected(client)) {
         ESP_LOGE("WS", "WebSocket não conectado");
+        xSemaphoreGive(ws_lifecycle_mutex);
         return false;
     }
 
     int len = strlen(json_msg);
 
-    int sent = esp_websocket_client_send_text(ws_client, json_msg, len, pdMS_TO_TICKS(5000));
+    int sent = esp_websocket_client_send_text(client, json_msg, len, pdMS_TO_TICKS(5000));
+    xSemaphoreGive(ws_lifecycle_mutex);
 
     if (sent < 0) {
         ESP_LOGE("WS", "Falha ao enviar mensagem WebSocket");
@@ -1256,7 +1476,29 @@ void patch_task(void *pvParameters) {
 
 /*############################################## Lora  ################################################*/
 
+static bool lora_apply_config_with_retries(int max_attempts, bool temporary) {
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        esp_err_t err = temporary ? lora_e32_apply_cfg_temp() : lora_e32_apply_cfg();
+        if (err == ESP_OK) {
+            gtw_lora_ready = true;
+            gtw_lora_uart_error_streak = 0;
+            gtw_lora_transaction_failures = 0;
+            return true;
+        }
+
+        ESP_LOGW("LORA_SETUP", "Falha ao configurar E32 tentativa %d/%d: %s", attempt, max_attempts,
+                 esp_err_to_name(err));
+        if (attempt < max_attempts)
+            vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    gtw_lora_ready = false;
+    return false;
+}
+
 static void lora_setup_gtw(void) {
+    msg_counter_gtw = (uint8_t)esp_random();
+
     lora_e32_config_t cfg = {
         .uart_num = UART_NUM_1,
         .tx_pin = 16,
@@ -1271,13 +1513,21 @@ static void lora_setup_gtw(void) {
         .head = 0xC0,
         .addh = 0x00,
         .addl = 0x01,
-        .speed = 0x18, // 9600 UART + menor air rate para alcance longo
+        .speed = 0x18, // configuracao legada usada pelos tanques instalados em campo
         .channel = 0x17,
         .option = 0x64,
     };
 
-    ESP_ERROR_CHECK(lora_e32_init(&cfg));
-    ESP_ERROR_CHECK(lora_e32_apply_cfg());
+    esp_err_t init_err = lora_e32_init(&cfg);
+    if (init_err != ESP_OK) {
+        gtw_lora_ready = false;
+        ESP_LOGE("LORA_SETUP", "Falha ao inicializar E32: %s", esp_err_to_name(init_err));
+        return;
+    }
+
+    if (!lora_apply_config_with_retries(MAX_RETRIES_CONFIG, false)) {
+        ESP_LOGE("LORA_SETUP", "E32 indisponivel; gateway continuara online e tentara recuperar em segundo plano");
+    }
 }
 
 #if (GTW_ROLE_RX_ONLY == 0)
@@ -1331,7 +1581,18 @@ void gtw_lora_rx_task(void *pvParameters) {
             xSemaphoreGive(MutexLora);
         }
 
-        if (len <= 0) {
+        if (len < 0) {
+            gtw_lora_uart_error_streak++;
+            ESP_LOGE(TAG, "Falha UART LoRa consecutiva %u/3", gtw_lora_uart_error_streak);
+            if (gtw_lora_uart_error_streak >= 3) {
+                gtw_lora_ready = false;
+                gtw_lora_uart_error_streak = 0;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (len == 0) {
             stats.timeout++;
             if ((stats.timeout % 500U) == 0U)
                 gtw_lora_log_rx_stats(&stats, "timeout_500");
@@ -1343,6 +1604,8 @@ void gtw_lora_rx_task(void *pvParameters) {
             continue;
         }
 
+        gtw_lora_ready = true;
+        gtw_lora_uart_error_streak = 0;
         stats.frame_ok++;
 #if (GTW_ROLE_TX_ONLY == 0)
         ESP_LOGI(TAG,
@@ -1514,22 +1777,33 @@ void gtw_lora_rx_task(void *pvParameters) {
 }
 
 static void gtw_lora_health_task(void *pvParameters) {
+#if (GTW_ROLE_TX_ONLY == 0)
     int recovery_cycles = 0;
     gtw_last_lora_rx_ms = esp_timer_get_time() / 1000;
+#endif
+    esp_task_wdt_add(NULL);
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(60000));
-
-        int64_t now_ms = esp_timer_get_time() / 1000;
-        int64_t silent_ms = now_ms - gtw_last_lora_rx_ms;
+        esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(30000));
 
 #if (GTW_ROLE_TX_ONLY != 0)
-        if (!gtw_ack_wait_is_active()) {
-            recovery_cycles = 0;
-            gtw_last_lora_rx_ms = now_ms;
+        if (gtw_lora_ready)
             continue;
+
+        ESP_LOGW("LORA_HEALTH", "E32 marcado como indisponivel; tentando reconfigurar");
+        if (xSemaphoreTake(gtw_request_mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            if (xSemaphoreTake(MutexLora, pdMS_TO_TICKS(5000)) == pdTRUE) {
+                bool recovered = lora_e32_reinit() == ESP_OK && lora_apply_config_with_retries(1, true);
+                xSemaphoreGive(MutexLora);
+                ESP_LOGI("LORA_HEALTH", "Recuperacao E32: %s", recovered ? "OK" : "FALHOU");
+            }
+            xSemaphoreGive(gtw_request_mutex);
         }
-#endif
+        continue;
+#else
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        int64_t silent_ms = now_ms - gtw_last_lora_rx_ms;
 
         if (silent_ms < 180000) {
             recovery_cycles = 0;
@@ -1542,7 +1816,7 @@ static void gtw_lora_health_task(void *pvParameters) {
             esp_err_t err = ESP_ERR_TIMEOUT;
 
             if (xSemaphoreTake(MutexLora, pdMS_TO_TICKS(5000)) == pdTRUE) {
-                err = lora_e32_apply_cfg();
+                err = lora_e32_apply_cfg_temp();
                 xSemaphoreGive(MutexLora);
             }
 
@@ -1563,6 +1837,7 @@ static void gtw_lora_health_task(void *pvParameters) {
             ESP_LOGE("LORA_HEALTH", "LoRa sem comunicação prolongada; gateway permanece online");
             recovery_cycles = 0;
         }
+#endif
     }
 }
 
@@ -1660,12 +1935,31 @@ static bool gtw_send_frame_wait_ack(lora_app_frame_t *frame) {
     if (!frame || !gtw_request_mutex || !gtw_ack_mutex)
         return false;
 
+    esp_task_wdt_reset();
     if (xSemaphoreTake(gtw_request_mutex, pdMS_TO_TICKS(15000)) != pdTRUE)
         return false;
 
-    bool success = false;
+    if (!gtw_lora_ready) {
+        bool recovered = false;
+        if (xSemaphoreTake(MutexLora, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            recovered = lora_e32_reinit() == ESP_OK && lora_apply_config_with_retries(MAX_RETRIES_CONFIG, true);
+            xSemaphoreGive(MutexLora);
+        }
 
-    for (int attempt = 1; attempt <= ACK_RETRIES; attempt++) {
+        if (!recovered) {
+            ESP_LOGE("GTW", "E32 indisponivel; transacao LoRa cancelada sem bloquear a fila");
+            xSemaphoreGive(gtw_request_mutex);
+            return false;
+        }
+    }
+
+    bool success = false;
+    const bool is_ping = frame->msg_type == MSG_PING;
+    const int attempt_limit = is_ping ? LORA_PING_ACK_RETRIES : ACK_RETRIES;
+    const uint32_t ack_timeout_ms = is_ping ? LORA_PING_ACK_TIMEOUT_MS : ACK_TIMEOUT_MS;
+
+    for (int attempt = 1; attempt <= attempt_limit; attempt++) {
+        esp_task_wdt_reset();
         ulTaskNotifyTake(pdTRUE, 0);
 
         xSemaphoreTake(gtw_ack_mutex, portMAX_DELAY);
@@ -1681,6 +1975,7 @@ static bool gtw_send_frame_wait_ack(lora_app_frame_t *frame) {
             int sent = lora_send_frame_air(frame);
             xSemaphoreGive(MutexLora);
             if (sent != (int)air_len) {
+                gtw_lora_ready = false;
                 ESP_LOGE("GTW", "TX LoRa incompleto: %d/%u", sent, (unsigned)air_len);
                 xSemaphoreTake(gtw_ack_mutex, portMAX_DELAY);
                 gtw_ack_wait.active = false;
@@ -1696,10 +1991,11 @@ static bool gtw_send_frame_wait_ack(lora_app_frame_t *frame) {
             continue;
         }
 
-        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ACK_TIMEOUT_MS)) > 0) {
+        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ack_timeout_ms)) > 0) {
             success = true;
             break;
         }
+        esp_task_wdt_reset();
 
         xSemaphoreTake(gtw_ack_mutex, portMAX_DELAY);
         gtw_ack_wait.active = false;
@@ -1707,14 +2003,27 @@ static bool gtw_send_frame_wait_ack(lora_app_frame_t *frame) {
         xSemaphoreGive(gtw_ack_mutex);
 
         ESP_LOGW("GTW", "Sem ACK do tanque %u, tentativa %d", frame->dst_id, attempt);
-        vTaskDelay(pdMS_TO_TICKS(LORA_RETRY_BACKOFF_MIN_MS + (esp_random() % LORA_RETRY_BACKOFF_JITTER_MS)));
+        if (attempt < attempt_limit) {
+            vTaskDelay(pdMS_TO_TICKS(LORA_RETRY_BACKOFF_MIN_MS + (esp_random() % LORA_RETRY_BACKOFF_JITTER_MS)));
+        }
     }
 
-    // O E32-900T30S não fornece AUX neste projeto. Mantém uma janela
-    // silenciosa antes de liberar o próximo comando/PING para evitar que
-    // o pacote seguinte alcance o tanque enquanto ele ainda transmite ACK
-    // ou telemetria resultante do comando anterior.
-    vTaskDelay(pdMS_TO_TICKS(LORA_TRANSACTION_GUARD_MS));
+    if (success) {
+        gtw_lora_transaction_failures = 0;
+    } else {
+        gtw_lora_transaction_failures++;
+        if (gtw_lora_transaction_failures >= GTW_LORA_FAILURES_BEFORE_RECOVERY) {
+            gtw_lora_transaction_failures = 0;
+            gtw_lora_ready = false;
+            ESP_LOGW("LORA_HEALTH", "Falhas LoRa consecutivas; E32 marcado para reinicializacao validada");
+        }
+    }
+
+    // O ping termina no ACK e precisa apenas de uma janela curta. Comandos
+    // mantêm a proteção maior porque podem gerar telemetria logo depois.
+    uint32_t guard_ms = is_ping ? LORA_PING_GUARD_MS : LORA_TRANSACTION_GUARD_MS;
+    vTaskDelay(pdMS_TO_TICKS(guard_ms));
+    esp_task_wdt_reset();
 
     xSemaphoreGive(gtw_request_mutex);
     return success;
@@ -1781,28 +2090,25 @@ static void ble_config_mode_task(void *pvParameters) {
 
     ble_startup_window_active = false;
     Connectado = 0;
-    TokenOk = 0;
 
 #if (GTW_ROLE_RX_ONLY == 0)
-    if (taskConnect_to_websocket != NULL || ws_client != NULL) {
+    if (websocket_task_is_running()) {
         stop_websocket_task = true;
 
-        for (int i = 0; i < 30 && taskConnect_to_websocket != NULL; i++) {
+        for (int i = 0; i < 350 && websocket_task_is_running(); i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
 
-        if (ws_client != NULL) {
-            ESP_LOGW(TAG, "WebSocket ainda ativo; solicitando stop para liberar memoria");
-            esp_websocket_client_stop(ws_client);
-        }
+        if (websocket_task_is_running())
+            ESP_LOGW(TAG, "WebSocket ainda finalizando; Wi-Fi sera desligado para concluir o encerramento");
     }
 #endif
 
-    if (wifi_is_active()) {
-        wifi_stop_driver();
+    if (taskConecta_WIFI != NULL) {
+        xTaskNotifyGive(taskConecta_WIFI);
     }
 
-    ESP_LOGI(TAG, "Modo configuracao BLE ativo; Wi-Fi desligado");
+    ESP_LOGI(TAG, "Modo configuracao BLE ativo; desligamento do Wi-Fi solicitado a task responsavel");
     ble_config_mode_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -1812,6 +2118,9 @@ static void ble_startup_window_task(void *pvParameters) {
         if (!bluetooth_config_is_active()) {
             ble_startup_window_active = false;
             ESP_LOGI(TAG, "Janela BLE do boot encerrada; Wi-Fi sera iniciado pela task");
+            if (taskConecta_WIFI != NULL) {
+                xTaskNotifyGive(taskConecta_WIFI);
+            }
             break;
         }
 
@@ -1839,6 +2148,9 @@ void bt_client_disconnected_callback(void) {
     ble_config_mode_active = false;
     ble_startup_window_active = false;
     ESP_LOGI(TAG, "Saindo do modo configuracao BLE; Wi-Fi sera retomado pela task");
+    if (taskConecta_WIFI != NULL) {
+        xTaskNotifyGive(taskConecta_WIFI);
+    }
 }
 
 static void bt_send_config_snapshot(void) {
@@ -1948,22 +2260,27 @@ void bt_message_received_callback(const char *message) {
             return;
         }
 
+        if (JsonUserId->valueint <= 0 || JsonUnidade->valueint <= 0 ||
+            JsonUserId->valuedouble != (double)JsonUserId->valueint ||
+            JsonUnidade->valuedouble != (double)JsonUnidade->valueint ||
+            JsonUserId->valueint != JsonUnidade->valueint) {
+            bluetooth_send_message("{\"ok\":false,\"error\":\"gateway_ids_must_match\"}");
+            cJSON_Delete(jsonBluetooth);
+            return;
+        }
+
         // Salva os valores no NVS
         save_UsetGTW(JsonUserGtw->valuestring);
         save_PasswordGTW(JsonPassword->valuestring);
         save_idGtw(JsonUserId->valueint);
-        save_idUnidadeGtw(JsonUnidade->valueint);
-        bluetooth_send_message("{\"ok\":true,\"status\":\"gtw_config_saved\"}");
+        save_idUnidadeGtw(JsonUserId->valueint);
+        strlcpy(userNameHTTPs, JsonUserGtw->valuestring, sizeof(userNameHTTPs));
+        strlcpy(passwordHTTPs, JsonPassword->valuestring, sizeof(passwordHTTPs));
+        ID_GATEWAY = JsonUserId->valueint;
+        DEVICE_ID = JsonUserId->valueint;
+        bluetooth_send_message("{\"ok\":true,\"status\":\"gtw_config_saved\",\"restart_required\":true}");
 
         cJSON_Delete(jsonBluetooth); // Libera a memória alocada para o JSON
-
-#if DEBUG_MODE
-        printf("Reiniciando o dispositivo apos configurarlo ...\n");
-#endif
-
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Aguardar 1 segundo antes de reiniciar
-
-        esp_restart(); // Resetar connect
         return;
     }
 
@@ -1989,20 +2306,12 @@ void bt_message_received_callback(const char *message) {
 
         save_SIIDWifi(JsonSSIDWifi->valuestring);
         save_PasswordWifi(JsonPasswordWifi->valuestring);
-        bluetooth_send_message("{\"ok\":true,\"status\":\"wifi_config_saved\"}");
+        bluetooth_send_message("{\"ok\":true,\"status\":\"wifi_config_saved\",\"restart_required\":true}");
 
         strlcpy(wifi_ssid, JsonSSIDWifi->valuestring, sizeof(wifi_ssid));
         strlcpy(wifi_password, JsonPasswordWifi->valuestring, sizeof(wifi_password));
 
         cJSON_Delete(jsonBluetooth);
-
-#if DEBUG_MODE
-        printf("Reiniciando o dispositivo apos configurarlo ...\n");
-#endif
-
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Aguardar 1 segundo antes de reiniciar
-
-        ConnectRest(); // Resetar connect
         return;
     }
 
@@ -2056,9 +2365,10 @@ void vTaskImprimirUsoMemoria(void *pvParameters) {
         // Recriar websocket se morreu (somente uma vez)
 #if (GTW_ROLE_RX_ONLY == 0)
         if (boot_cycles > 3) {
-            if (taskConnect_to_websocket == NULL && TokenOk && Connectado) {
+            if (!websocket_task_is_running() && TokenOk == 1 && Connectado == 1) {
                 ESP_LOGW("MEMORY", "Reconectando WebSocket...");
-                xTaskCreate(connect_to_websocket, "connect_to_websocket", 2048 * 6, NULL, 5, &taskConnect_to_websocket);
+                if (!websocket_task_start_if_needed())
+                    ESP_LOGE("MEMORY", "Falha ao recriar task WebSocket");
             }
         } else {
             boot_cycles++;
@@ -2129,19 +2439,33 @@ void save_PasswordGTW(const char *password) {
 // Função para salvar o estado ID do GTW na NVS
 void save_idGtw(int state) {
     nvs_handle_t my_handle;
-    nvs_open("idGtw", NVS_READWRITE, &my_handle);
-    nvs_set_i32(my_handle, "idGtw", state);
-    nvs_commit(my_handle);
+    esp_err_t err = nvs_open("idGtw", NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE("NVS", "Falha ao abrir ID gateway: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_i32(my_handle, "idGtw", state);
+    if (err == ESP_OK)
+        err = nvs_commit(my_handle);
     nvs_close(my_handle);
+    if (err != ESP_OK)
+        ESP_LOGE("NVS", "Falha ao salvar ID gateway: %s", esp_err_to_name(err));
 }
 
 // Função para salvar o ID da Unidade do GTW na NVS
 void save_idUnidadeGtw(int state) {
     nvs_handle_t my_handle;
-    nvs_open("idUnidadeGtw", NVS_READWRITE, &my_handle);
-    nvs_set_i32(my_handle, "idUnidadeGtw", state);
-    nvs_commit(my_handle);
+    esp_err_t err = nvs_open("idUnidadeGtw", NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE("NVS", "Falha ao abrir ID unidade: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_i32(my_handle, "idUnidadeGtw", state);
+    if (err == ESP_OK)
+        err = nvs_commit(my_handle);
     nvs_close(my_handle);
+    if (err != ESP_OK)
+        ESP_LOGE("NVS", "Falha ao salvar ID unidade: %s", esp_err_to_name(err));
 }
 
 /*######################################### Tratamento de Erros ############################################*/

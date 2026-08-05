@@ -3,6 +3,7 @@
 #include "nvs_flash.h"
 #include "salvar_nvs.h"
 #include "esp_log.h"
+#include <stdlib.h>
 
 void nvs_salvar_float(char *float_key, float valor)
 {
@@ -28,24 +29,26 @@ void nvs_salvar_float(char *float_key, float valor)
 float nvs_resgatar_float(char *key)
 {
     nvs_handle_t nvs_handle;
-    char Valor_str[25];
+    char Valor_str[25] = {0};
     size_t tamanho_valor_str = sizeof(Valor_str);
-    float valor_f;
+    float valor_f = -1.0f;
 
-    ESP_ERROR_CHECK(nvs_open("armazenamento", NVS_READWRITE, &nvs_handle));
+    esp_err_t open_err = nvs_open("armazenamento", NVS_READONLY, &nvs_handle);
+    if (open_err != ESP_OK) {
+        ESP_LOGW("NVS", "Namespace armazenamento indisponivel: %s", esp_err_to_name(open_err));
+        return valor_f;
+    }
 
     esp_err_t ret = nvs_get_str(nvs_handle, key, Valor_str, &tamanho_valor_str);
-
-    sscanf(Valor_str, "%f", &valor_f);
-
-    if (ret == ESP_ERR_NVS_NOT_FOUND)
-    {
-        valor_f = -1; // Valor padrão
-        ESP_LOGE("nvs_resgatar_float", "Valor não encontrado, retornando valor padrão = %f\n", valor_f);
-    }
-    else
-    {
-        ESP_ERROR_CHECK(ret);
+    if (ret == ESP_OK) {
+        char *end = NULL;
+        float parsed = strtof(Valor_str, &end);
+        if (end != Valor_str && *end == '\0')
+            valor_f = parsed;
+        else
+            ESP_LOGW("NVS", "Valor float invalido para chave %s", key);
+    } else if (ret != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW("NVS", "Falha ao ler chave %s: %s", key, esp_err_to_name(ret));
     }
 
     nvs_close(nvs_handle);
@@ -60,8 +63,9 @@ int load_idGTW(void)
 {
     nvs_handle_t my_handle;
     int32_t state = 0; // Valor padrão
-    nvs_open("idGtw", NVS_READONLY, &my_handle);
-    nvs_get_i32(my_handle, "idGtw", &state);
+    if (nvs_open("idGtw", NVS_READONLY, &my_handle) != ESP_OK)
+        return state;
+    (void)nvs_get_i32(my_handle, "idGtw", &state);
     nvs_close(my_handle);
     return state;
 }
@@ -71,8 +75,9 @@ int load_idUnidadeGTW(void)
 {
     nvs_handle_t my_handle;
     int32_t state = 0; // Valor padrão
-    nvs_open("idUnidadeGtw", NVS_READONLY, &my_handle);
-    nvs_get_i32(my_handle, "idUnidadeGtw", &state);
+    if (nvs_open("idUnidadeGtw", NVS_READONLY, &my_handle) != ESP_OK)
+        return state;
+    (void)nvs_get_i32(my_handle, "idUnidadeGtw", &state);
     nvs_close(my_handle);
     return state;
 }

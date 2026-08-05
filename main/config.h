@@ -42,15 +42,20 @@
 
 #define ACK_TIMEOUT_MS 15000
 #define ACK_RETRIES 6
+#define LORA_PING_ACK_TIMEOUT_MS 10000
+#define LORA_PING_ACK_RETRIES 5
 #define LORA_TRANSACTION_GUARD_MS 5000
+#define LORA_PING_GUARD_MS 0
 #define LORA_RETRY_BACKOFF_MIN_MS 700
 #define LORA_RETRY_BACKOFF_JITTER_MS 1300
 #define GTW_LORA_RX_TIMEOUT_MS 800
 #define GTW_TX_IDLE_RX_SLEEP_MS 120
 #define GTW_LORA_MUTEX_WAIT_MS 300
+#define GTW_LORA_FAILURES_BEFORE_RECOVERY 1
 
 extern int DEVICE_ID;
 
+// 1 = teste com logs detalhados; 0 = producao com logs essenciais
 #define DEBUG_MODE 1
 
 #define Get_Estacao_Rota "/estacao/leitura/"
@@ -58,7 +63,7 @@ extern int DEVICE_ID;
 #define Firm_Download_id "/files/download/"
 #define leituraGtw "/users/gtw/"
 
-#define MAX_RETRIES_CONFIG 10
+#define MAX_RETRIES_CONFIG 5
 #define TAG "Main"
 
 #define TAG_atualizacao_OTA "Atialzação OTA"
@@ -66,17 +71,19 @@ extern int DEVICE_ID;
 #define TAG_Atualiza_firmware "Atualiza_firmware"
 #define NVS_KEY_Fversion "Firm_version"
 
-#define MAX_RECONNECT_ATTEMPTS 8
 #define PATH_SIZE 64
 #define BODY_SIZE 256
 #define QUEUE_LENGTH 64
 #define WS_MSG_MAX_LEN 512
 #define WS_QUEUE_LEN 20
+#define WS_RETRY_DELAY_MS 5000U
 
-#define WIFI_INTERNET_MAX_FAILS 5
-#define WIFI_CONNECT_MAX_FAILS 5
+#define WIFI_CONNECT_MAX_FAILS 15
 #define WIFI_CYCLE_MAX_RETRIES 5
-#define WIFI_OFF_DELAY_MS 10000
+#define WIFI_IP_MAX_FAILS 12
+#define WIFI_MONITOR_INTERVAL_MS 5000U
+#define WIFI_DRIVER_RESTART_DELAY_MS 3000U
+#define WIFI_INTERNET_RESTART_DELAY_MS (30U * 60U * 1000U)
 
 #define LORA_PREAMBLE 0xAA
 
@@ -183,8 +190,8 @@ extern int ID_GATEWAY;
 
 extern int bleOFF;
 
-extern char userNameHTTPs[30];
-extern char passwordHTTPs[25];
+extern char userNameHTTPs[64];
+extern char passwordHTTPs[65];
 
 extern bool wifi_secundario;
 extern bool usando_secundario;
@@ -193,8 +200,8 @@ extern bool PressaoBomba;
 
 extern int wifi_secundario_ativo;
 
-extern char wifi_ssid[30];
-extern char wifi_password[25];
+extern char wifi_ssid[33];
+extern char wifi_password[65];
 
 extern int TokenOk;
 

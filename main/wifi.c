@@ -5,10 +5,16 @@
 #include "esp_log.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
+#include <errno.h>
 #include <string.h>
 
 static const char *TAG = "WiFiConnect";
 static EventGroupHandle_t wifi_event_group;
+
+#define INTERNET_CHECK_HOST "connectivitycheck.gstatic.com"
+#define INTERNET_CHECK_PORT "80"
+#define INTERNET_CHECK_REQUEST                                                                                         \
+    "GET /generate_204 HTTP/1.1\r\nHost: connectivitycheck.gstatic.com\r\nConnection: close\r\n\r\n"
 
 static const int WIFI_CONNECTED_BIT = BIT0;
 static const int WIFI_FAIL_BIT = BIT1;
@@ -31,6 +37,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
         ESP_LOGI(TAG, "Wi-Fi obteve IP");
     }
+    else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP)
+    {
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        ESP_LOGW(TAG, "Wi-Fi perdeu o endereco IP");
+    }
 }
 
 bool wifi_start_driver(void)
@@ -40,21 +51,42 @@ bool wifi_start_driver(void)
 
     if (!netif_inited)
     {
-        esp_netif_init();
-        esp_event_loop_create_default();
+        esp_err_t init_err = esp_netif_init();
+        if (init_err != ESP_OK && init_err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "Falha ao inicializar esp_netif: %s", esp_err_to_name(init_err));
+            return false;
+        }
+
+        init_err = esp_event_loop_create_default();
+        if (init_err != ESP_OK && init_err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "Falha ao criar event loop: %s", esp_err_to_name(init_err));
+            return false;
+        }
         netif_inited = true;
     }
 
-    if (!sta_netif)
+    if (!sta_netif) {
         sta_netif = esp_netif_create_default_wifi_sta();
+        if (!sta_netif) {
+            ESP_LOGE(TAG, "Falha ao criar interface Wi-Fi STA");
+            return false;
+        }
+    }
 
-    if (!wifi_event_group)
+    if (!wifi_event_group) {
         wifi_event_group = xEventGroupCreate();
+        if (!wifi_event_group) {
+            ESP_LOGE(TAG, "Falha ao criar grupo de eventos Wi-Fi");
+            return false;
+        }
+    }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_err_t err = esp_wifi_init(&cfg);
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha em esp_wifi_init: %s", esp_err_to_name(err));
         return false;
+    }
     if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK ||
         esp_wifi_set_storage(WIFI_STORAGE_RAM) != ESP_OK ||
         esp_wifi_set_ps(WIFI_PS_NONE) != ESP_OK) {
@@ -64,12 +96,26 @@ bool wifi_start_driver(void)
 
     if (!handlers_registered)
     {
-        esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
-        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
+        err = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Falha ao registrar eventos Wi-Fi: %s", esp_err_to_name(err));
+            esp_wifi_deinit();
+            return false;
+        }
+
+        err = esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Falha ao registrar eventos IP: %s", esp_err_to_name(err));
+            esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler);
+            esp_wifi_deinit();
+            return false;
+        }
         handlers_registered = true;
     }
 
-    if (esp_wifi_start() != ESP_OK) {
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha em esp_wifi_start: %s", esp_err_to_name(err));
         esp_wifi_deinit();
         return false;
     }
@@ -93,12 +139,28 @@ void wifi_stop_driver(void)
 
 bool wifi_connect_credentials(const char *ssid, const char *pass, int timeout_ms)
 {
+    if (!wifi_started || !wifi_event_group || !ssid || ssid[0] == '\0') {
+        ESP_LOGE(TAG, "Tentativa de conexao Wi-Fi com driver ou credenciais invalidas");
+        return false;
+    }
+
     wifi_config_t cfg = {0};
     strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
     strncpy((char *)cfg.sta.password, pass, sizeof(cfg.sta.password) - 1);
 
-    esp_wifi_set_config(WIFI_IF_STA, &cfg);
-    esp_wifi_connect();
+    xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao configurar Wi-Fi: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Falha ao iniciar conexao Wi-Fi: %s", esp_err_to_name(err));
+        return false;
+    }
 
     EventBits_t bits = xEventGroupWaitBits(
         wifi_event_group,
@@ -119,6 +181,11 @@ bool wifi_sta_connected(void)
     return (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
 }
 
+bool wifi_sta_has_ip(void)
+{
+    return wifi_event_group && (xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT);
+}
+
 bool wifi_check_internet(int timeout_ms)
 {
     struct addrinfo hints = {0};
@@ -126,22 +193,53 @@ bool wifi_check_internet(int timeout_ms)
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
 
-    if (getaddrinfo("83cd1aa837661fab941b2c5a2a65424b.jm.net.br", "2087", &hints, &res) != 0 || !res)
-        return false;
-
-    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0)
-    {
-        freeaddrinfo(res);
+    int dns_err = getaddrinfo(INTERNET_CHECK_HOST, INTERNET_CHECK_PORT, &hints, &res);
+    if (dns_err != 0 || !res) {
+        ESP_LOGW(TAG, "Falha DNS no teste de internet: host=%s erro=%d", INTERNET_CHECK_HOST, dns_err);
         return false;
     }
 
+    bool ok = false;
+    int last_errno = 0;
+    char response[64];
     struct timeval tv = {.tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000};
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    bool ok = (connect(sock, res->ai_addr, res->ai_addrlen) == 0);
-    close(sock);
+    for (struct addrinfo *addr = res; addr != NULL; addr = addr->ai_next) {
+        int sock = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+        if (sock < 0) {
+            last_errno = errno;
+            continue;
+        }
+
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        if (connect(sock, addr->ai_addr, addr->ai_addrlen) == 0) {
+            int sent = send(sock, INTERNET_CHECK_REQUEST, strlen(INTERNET_CHECK_REQUEST), 0);
+            int received = sent > 0 ? recv(sock, response, sizeof(response) - 1, 0) : -1;
+
+            if (received > 0) {
+                response[received] = '\0';
+                ok = strstr(response, "HTTP/1.1 204") != NULL || strstr(response, "HTTP/1.0 204") != NULL;
+            }
+
+            if (!ok)
+                last_errno = errno;
+        }
+        else {
+            last_errno = errno;
+        }
+        close(sock);
+
+        if (ok)
+            break;
+    }
+
     freeaddrinfo(res);
+
+    if (!ok) {
+        ESP_LOGW(TAG, "Sem internet confirmada pelo Google: host=%s errno=%d", INTERNET_CHECK_HOST, last_errno);
+    }
+
     return ok;
 }

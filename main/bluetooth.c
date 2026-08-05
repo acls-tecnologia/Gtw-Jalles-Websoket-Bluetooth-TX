@@ -154,7 +154,6 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         ESP_LOGI(BLE_TAG, "Cliente BLE desconectado");
         active_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         notify_enabled = false;
-        bt_client_disconnected_callback();
         if (ble_window_open) {
             ble_stop_async();
         }
@@ -433,11 +432,12 @@ void bluetooth_config_stop(void)
 
     set_status("{\"ok\":true,\"status\":\"closed\"}");
     ESP_LOGI(BLE_TAG, "Janela BLE fechada");
+    bt_client_disconnected_callback();
 }
 
 bool bluetooth_config_is_active(void)
 {
-    return ble_window_open;
+    return ble_window_open || ble_stack_started || ble_stack_stopping;
 }
 
 void bluetooth_send_message(const char *message)
