@@ -36,6 +36,20 @@
 #define GTW_ROLE_RX_ONLY 0
 #define GTW_ROLE_NAME "GTW_TX"
 
+// Familia IP usada por todas as conexoes de rede deste gateway.
+// 1 = IPv6; 0 = IPv4. As duas pilhas ficam habilitadas no sdkconfig.
+#define GTW_USE_IPV6 1
+
+#if (GTW_USE_IPV6 != 0) && (GTW_USE_IPV6 != 1)
+#error "GTW_USE_IPV6 deve ser 0 (IPv4) ou 1 (IPv6)"
+#endif
+
+#if GTW_USE_IPV6
+#define GTW_IP_VERSION_NAME "IPv6"
+#else
+#define GTW_IP_VERSION_NAME "IPv4"
+#endif
+
 #if (GTW_ROLE_TX_ONLY == GTW_ROLE_RX_ONLY)
 #error "Configure exatamente um papel: GTW_ROLE_TX_ONLY ou GTW_ROLE_RX_ONLY"
 #endif
@@ -77,13 +91,14 @@ extern int DEVICE_ID;
 #define WS_MSG_MAX_LEN 512
 #define WS_QUEUE_LEN 20
 #define WS_RETRY_DELAY_MS 5000U
+#define WS_RECREATE_AFTER_MS 60000U
 
 #define WIFI_CONNECT_MAX_FAILS 15
 #define WIFI_CYCLE_MAX_RETRIES 5
 #define WIFI_IP_MAX_FAILS 12
 #define WIFI_MONITOR_INTERVAL_MS 5000U
 #define WIFI_DRIVER_RESTART_DELAY_MS 3000U
-#define WIFI_INTERNET_RESTART_DELAY_MS (30U * 60U * 1000U)
+#define WIFI_INTERNET_RESTART_DELAY_MS (5U * 60U * 1000U)
 
 #define LORA_PREAMBLE 0xAA
 

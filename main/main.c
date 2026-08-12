@@ -1,4 +1,5 @@
 #include "config.h" //Configuração do projeto
+#include "network_mode.h"
 
 #define BLE_STARTUP_WINDOW_MS (30 * 1000U)
 #define HTTP_MUTEX_WAIT_MS 20000U
@@ -61,6 +62,8 @@ typedef struct {
 #if (GTW_ROLE_RX_ONLY == 0)
 static SemaphoreHandle_t gtw_ack_mutex = NULL;
 static SemaphoreHandle_t ws_lifecycle_mutex = NULL;
+// Permanece ativo ate uma nova task WebSocket ser criada com sucesso.
+static volatile bool websocket_restart_requested = false;
 #endif
 static SemaphoreHandle_t gtw_request_mutex = NULL;
 #if (GTW_ROLE_TX_ONLY == 0)
@@ -413,8 +416,10 @@ void app_main(void) {
     ESP_LOGW(TAG, "Modo RX_ONLY: WebSocket Processor desativado");
 #endif
 
-    if (xTaskCreate(vTaskImprimirUsoMemoria, "MonitorMemoria", 6144, NULL, 3, &taskImprimirUsoMemoria) != pdPASS)
+    if (xTaskCreate(vTaskImprimirUsoMemoria, "MonitorMemoria", 6144, NULL, 3, &taskImprimirUsoMemoria) != pdPASS) {
         ESP_LOGE(TAG, "Falha ao criar task Monitor de Memória");
+        ConnectRest();
+    }
 
     /****************************************
      * 7️⃣ Sistema inicializado
@@ -517,32 +522,41 @@ void wifi_task(void *pv) {
             falhas_ip = 0;
             ciclos_religar = 0;
 
-            bool internet_disponivel = false;
-
-#if (GTW_ROLE_RX_ONLY == 0)
-            internet_disponivel = websocket_is_connected();
-#endif
-
-            if (!internet_disponivel) {
-                internet_disponivel = wifi_check_internet(INTERNET_CHECK_TIMEOUT_MS);
+            // A task de login precisa existir antes do WebSocket, pois e ela que obtem o token.
+            // Portanto, sua criacao depende da rede/IP e nao da flag Connectado do TX.
+            if (Task_login_task == NULL) {
+                if (xTaskCreate(login_task, "login_task", 1024 * 8, NULL, 5, &Task_login_task) == pdPASS) {
+                    ESP_LOGI(TAG, "Task de login criada; aguardando API para obter o token");
+                } else {
+                    Task_login_task = NULL;
+                    ESP_LOGE(TAG, "Falha ao criar task de login; nova tentativa no proximo ciclo");
+                }
             }
 
-            if (internet_disponivel) {
-                Connectado = 1;
+            bool websocket_conectado = false;
+            bool internet_google = false;
+
+#if (GTW_ROLE_RX_ONLY == 0)
+            websocket_conectado = websocket_is_connected();
+#endif
+
+            // No TX, online significa exclusivamente WebSocket conectado.
+            Connectado = websocket_conectado ? 1 : 0;
+
+            if (!websocket_conectado) {
+                internet_google = wifi_check_internet(INTERNET_CHECK_TIMEOUT_MS);
+            }
+
+            if (websocket_conectado || internet_google) {
                 falhas_internet = 0;
                 inicio_falha_internet_ms = 0;
 #if DEBUG_MODE
-                ESP_LOGI(TAG, "Wi-Fi conectado e internet disponivel");
-#endif
-
-                if (Task_login_task == NULL) {
-                    if (xTaskCreate(login_task, "login_task", 1024 * 8, NULL, 5, &Task_login_task) == pdPASS) {
-                        ESP_LOGI(TAG, "Task de login criada; timer inicia apos receber o primeiro token");
-                    } else {
-                        Task_login_task = NULL;
-                        ESP_LOGE(TAG, "Falha ao criar task de login");
-                    }
+                if (websocket_conectado) {
+                    ESP_LOGI(TAG, "TX online: WebSocket conectado");
+                } else {
+                    ESP_LOGW(TAG, "Internet confirmada pelo Google, mas TX offline: WebSocket desconectado");
                 }
+#endif
 
                 if (wifi_secundario) {
                     if (TokenOk == 1 && wifi_secundario_ativo == 1 && wifi_4G == 0) {
@@ -561,7 +575,7 @@ void wifi_task(void *pv) {
                          (unsigned long)(sem_internet_ms / 1000U), falhas_internet);
 
                 if (sem_internet_ms >= WIFI_INTERNET_RESTART_DELAY_MS) {
-                    ESP_LOGW(TAG, "Sem internet por 30 minutos; reiniciando somente o driver Wi-Fi");
+                    ESP_LOGW(TAG, "Sem internet por 5 minutos; reiniciando somente o driver Wi-Fi");
                     falhas_internet = 0;
                     inicio_falha_internet_ms = 0;
 
@@ -664,8 +678,8 @@ void login_task(void *pvParameters) {
                  pcTaskGetName(NULL), stack_remain, stack_remain * sizeof(StackType_t));
 #endif
 
-        if (!wifi_sta_connected() || !wifi_sta_has_ip() || Connectado != 1) {
-            ESP_LOGI(TAG, "Aguardando internet para obter ou renovar o token...");
+        if (!wifi_sta_connected() || !wifi_sta_has_ip()) {
+            ESP_LOGI(TAG, "Aguardando Wi-Fi e IP para obter ou renovar o token...");
             vTaskDelay(pdMS_TO_TICKS(10000));
             continue;
         }
@@ -693,6 +707,7 @@ void login_task(void *pvParameters) {
                 }
             } else {
                 ESP_LOGW(TAG, "Task de WebSocket já está em execução.");
+                Connectado = 0;
                 stop_websocket_task = true;
                 for (int i = 0; i < 400 && websocket_task_is_running(); i++) {
                     if ((i % 100) == 0)
@@ -796,11 +811,14 @@ static bool websocket_task_start_if_needed(void) {
 
     bool ok = true;
     if (taskConnect_to_websocket == NULL) {
+        Connectado = 0;
         stop_websocket_task = false;
         if (xTaskCreate(connect_to_websocket, "connect_to_websocket", 2048 * 6, NULL, 5, &taskConnect_to_websocket) !=
             pdPASS) {
             taskConnect_to_websocket = NULL;
             ok = false;
+        } else {
+            websocket_restart_requested = false;
         }
     }
 
@@ -808,10 +826,32 @@ static bool websocket_task_start_if_needed(void) {
     return ok;
 }
 
+static bool websocket_wait_before_setup_retry(uint32_t *setup_failure_ms) {
+    Connectado = 0;
+
+    if (stop_websocket_task) {
+        return false;
+    }
+
+    *setup_failure_ms += WS_RETRY_DELAY_MS;
+    if (*setup_failure_ms >= WS_RECREATE_AFTER_MS) {
+        ESP_LOGE(TAG, "Inicializacao WebSocket falhou por %lu s; destruindo task para recriar",
+                 (unsigned long)(*setup_failure_ms / 1000U));
+        websocket_restart_requested = true;
+        stop_websocket_task = true;
+        return false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(WS_RETRY_DELAY_MS));
+    return true;
+}
+
 void connect_to_websocket(void *pvParameters) {
 
     static char tmp[900];
+    static char ws_path[800];
     esp_task_wdt_add(NULL);
+    uint32_t setup_failure_ms = 0;
 
     while (!stop_websocket_task) {
         esp_task_wdt_reset();
@@ -821,18 +861,31 @@ void connect_to_websocket(void *pvParameters) {
             continue;
         }
 
-        snprintf(tmp, sizeof(tmp), "wss://" API_HOST ":" API_PORT "/ws-native/native-ws?token=%s", token_global);
+        snprintf(ws_path, sizeof(ws_path), "/ws-native/native-ws?token=%s", token_global);
+        snprintf(tmp, sizeof(tmp), "wss://" API_HOST ":" API_PORT "%s", ws_path);
         char *local_url = strdup(tmp);
 
         if (!local_url) {
             ESP_LOGE("WS", "Sem memoria para a URL do WebSocket; nova tentativa em 5s");
-            vTaskDelay(pdMS_TO_TICKS(WS_RETRY_DELAY_MS));
+            if (!websocket_wait_before_setup_retry(&setup_failure_ms))
+                break;
+            continue;
+        }
+
+        gtw_websocket_transport_t network_transport = {0};
+        esp_err_t transport_err = gtw_websocket_transport_init(&network_transport, ws_path, rootCaCerticate);
+        if (transport_err != ESP_OK) {
+            ESP_LOGE(TAG, "Falha ao preparar transporte WebSocket %s: %s", GTW_IP_VERSION_NAME,
+                     esp_err_to_name(transport_err));
+            free(local_url);
+            if (!websocket_wait_before_setup_retry(&setup_failure_ms))
+                break;
             continue;
         }
 
         esp_websocket_client_config_t websocket_cfg = {
             .uri = local_url,
-            .cert_pem = rootCaCerticate,
+            .ext_transport = network_transport.websocket,
             .reconnect_timeout_ms = 5000,
             .network_timeout_ms = 30000,
             .disable_auto_reconnect = false,
@@ -841,8 +894,10 @@ void connect_to_websocket(void *pvParameters) {
         esp_websocket_client_handle_t local_client = esp_websocket_client_init(&websocket_cfg);
         if (local_client == NULL) {
             ESP_LOGE(TAG, "Falha ao inicializar WebSocket; nova tentativa em 5s");
+            gtw_websocket_transport_cleanup(&network_transport);
             free(local_url);
-            vTaskDelay(pdMS_TO_TICKS(WS_RETRY_DELAY_MS));
+            if (!websocket_wait_before_setup_retry(&setup_failure_ms))
+                break;
             continue;
         }
 
@@ -851,8 +906,10 @@ void connect_to_websocket(void *pvParameters) {
         if (event_err != ESP_OK) {
             ESP_LOGE(TAG, "Falha ao registrar eventos WebSocket: %s", esp_err_to_name(event_err));
             esp_websocket_client_destroy(local_client);
+            gtw_websocket_transport_cleanup(&network_transport);
             free(local_url);
-            vTaskDelay(pdMS_TO_TICKS(WS_RETRY_DELAY_MS));
+            if (!websocket_wait_before_setup_retry(&setup_failure_ms))
+                break;
             continue;
         }
 
@@ -869,24 +926,39 @@ void connect_to_websocket(void *pvParameters) {
             websocket_url = NULL;
             xSemaphoreGive(ws_lifecycle_mutex);
             esp_websocket_client_destroy(local_client);
+            gtw_websocket_transport_cleanup(&network_transport);
             free(local_url);
-            vTaskDelay(pdMS_TO_TICKS(WS_RETRY_DELAY_MS));
+            if (!websocket_wait_before_setup_retry(&setup_failure_ms))
+                break;
             continue;
         }
 
+        setup_failure_ms = 0;
         ESP_LOGI(TAG, "Cliente WebSocket iniciado; aguardando conexao...");
         uint32_t disconnected_log_ms = 0;
+        uint32_t disconnected_total_ms = 0;
 
         while (!stop_websocket_task) {
             esp_task_wdt_reset();
             if (esp_websocket_client_is_connected(local_client)) {
                 disconnected_log_ms = 0;
+                disconnected_total_ms = 0;
             } else {
                 disconnected_log_ms += 1000U;
+                disconnected_total_ms += 1000U;
 
                 if (disconnected_log_ms >= WS_RETRY_DELAY_MS) {
-                    ESP_LOGW(TAG, "WebSocket desconectado; reconexao automatica continua ativa");
+                    ESP_LOGW(TAG, "WebSocket desconectado ha %lu s; reconexao automatica continua ativa",
+                             (unsigned long)(disconnected_total_ms / 1000U));
                     disconnected_log_ms = 0;
+                }
+
+                if (disconnected_total_ms >= WS_RECREATE_AFTER_MS) {
+                    ESP_LOGE(TAG, "WebSocket nao reconectou em %lu s; destruindo cliente e task para recriar",
+                             (unsigned long)(WS_RECREATE_AFTER_MS / 1000U));
+                    websocket_restart_requested = true;
+                    stop_websocket_task = true;
+                    break;
                 }
             }
 
@@ -894,6 +966,7 @@ void connect_to_websocket(void *pvParameters) {
         }
 
         ESP_LOGI(TAG, "Encerrando instancia atual do WebSocket...");
+        Connectado = 0;
         xSemaphoreTake(ws_lifecycle_mutex, portMAX_DELAY);
         esp_websocket_client_stop(local_client);
         esp_websocket_client_destroy(local_client);
@@ -903,6 +976,7 @@ void connect_to_websocket(void *pvParameters) {
             websocket_url = NULL;
         xSemaphoreGive(ws_lifecycle_mutex);
 
+        gtw_websocket_transport_cleanup(&network_transport);
         free(local_url);
 
         if (!stop_websocket_task) {
@@ -911,6 +985,7 @@ void connect_to_websocket(void *pvParameters) {
     }
 
     ESP_LOGI(TAG, "Task WebSocket encerrada por solicitacao");
+    Connectado = 0;
     xSemaphoreTake(ws_lifecycle_mutex, portMAX_DELAY);
     taskConnect_to_websocket = NULL;
     xSemaphoreGive(ws_lifecycle_mutex);
@@ -927,12 +1002,14 @@ static void websocket_event_handler(void *arg, esp_event_base_t event_base, int3
 
     switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
+        Connectado = 1;
 #if DEBUG_MODE
         ESP_LOGI(TAG_Websocket, "WebSocket conectado");
 #endif
         break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
+        Connectado = 0;
 #if DEBUG_MODE
         ESP_LOGW(TAG_Websocket, "WebSocket desconectado; reconexao automatica mantida");
 #endif
@@ -972,9 +1049,24 @@ static void websocket_event_handler(void *arg, esp_event_base_t event_base, int3
         break;
 
     case WEBSOCKET_EVENT_ERROR:
-#if DEBUG_MODE
-        ESP_LOGE(TAG_Websocket, "Erro no WebSocket");
-#endif
+        Connectado = 0;
+        ESP_LOGE(TAG_Websocket,
+                 "Erro WebSocket: tipo=%d http=%d tls=0x%x stack=0x%x errno=%d",
+                 data->error_handle.error_type, data->error_handle.esp_ws_handshake_status_code,
+                 (unsigned)data->error_handle.esp_tls_last_esp_err,
+                 (unsigned)data->error_handle.esp_tls_stack_err,
+                 data->error_handle.esp_transport_sock_errno);
+
+        if (data->error_handle.esp_ws_handshake_status_code == 401 ||
+            data->error_handle.esp_ws_handshake_status_code == 403) {
+            ESP_LOGW(TAG_Websocket, "Token recusado pelo WebSocket; solicitando novo login");
+            token_global[0] = '\0';
+            TokenOk = 0;
+            websocket_restart_requested = true;
+            stop_websocket_task = true;
+            if (Task_login_task != NULL)
+                xTaskNotifyGive(Task_login_task);
+        }
         break;
 
     default:
@@ -2362,16 +2454,23 @@ void vTaskImprimirUsoMemoria(void *pvParameters) {
             ConnectRest();
         }
 
-        // Recriar websocket se morreu (somente uma vez)
+        // Recria o WebSocket. Um pedido explicito permanece ativo ate xTaskCreate ter sucesso.
 #if (GTW_ROLE_RX_ONLY == 0)
-        if (boot_cycles > 3) {
-            if (!websocket_task_is_running() && TokenOk == 1 && Connectado == 1) {
-                ESP_LOGW("MEMORY", "Reconectando WebSocket...");
-                if (!websocket_task_start_if_needed())
-                    ESP_LOGE("MEMORY", "Falha ao recriar task WebSocket");
+        bool websocket_should_start =
+            TokenOk == 1 && token_global[0] != '\0' && wifi_sta_connected() && wifi_sta_has_ip();
+        if ((boot_cycles > 3 || websocket_restart_requested) && !websocket_task_is_running() &&
+            websocket_should_start) {
+            ESP_LOGW("MEMORY", "Recriando task WebSocket%s...",
+                     websocket_restart_requested ? " apos desconexao prolongada" : "");
+            if (!websocket_task_start_if_needed()) {
+                ESP_LOGE("MEMORY", "Falha ao recriar task WebSocket; nova tentativa no proximo ciclo");
             }
-        } else {
+        }
+
+        if (boot_cycles <= 3) {
             boot_cycles++;
+        } else {
+            boot_cycles = 4;
         }
 #else
         boot_cycles++;

@@ -7,6 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if GTW_USE_IPV6
+#define GTW_HTTP_ADDR_TYPE HTTP_ADDR_TYPE_INET6
+#else
+#define GTW_HTTP_ADDR_TYPE HTTP_ADDR_TYPE_INET
+#endif
+
 // TAG para logs
 static const char *TAG_GET = "HTTP_GET_JSON";
 static const char *TAGLogin = "LOGIN";
@@ -81,6 +87,7 @@ bool fazer_login(const char *usuario, const char *senha) {
         .buffer_size = 4096,
         .cert_pem = rootCaCerticate,
         .transport_type = HTTP_TRANSPORT_OVER_TCP,
+        .addr_type = GTW_HTTP_ADDR_TYPE,
         .event_handler = _http_event_handler,
     };
 
@@ -178,6 +185,7 @@ int server_request(const char *url, const char *body, http_method_t method) {
         .buffer_size = 1024,
         .buffer_size_tx = 2048,
         .transport_type = HTTP_TRANSPORT_OVER_TCP,
+        .addr_type = GTW_HTTP_ADDR_TYPE,
         .cert_pem = rootCaCerticate,
         .disable_auto_redirect = true,
         .event_handler = NULL,
@@ -288,6 +296,7 @@ static esp_http_client_handle_t get_json_client(const char *url) {
             .method = HTTP_METHOD_GET,
             .timeout_ms = 5000,
             .transport_type = HTTP_TRANSPORT_OVER_SSL,
+            .addr_type = GTW_HTTP_ADDR_TYPE,
             .disable_auto_redirect = true,
             .cert_pem = rootCaCerticate,
             .event_handler = _http_event_handler_get,
