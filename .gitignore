@@ -88,4 +88,4 @@ core_dump/
 *.key
 
 # Segredo compartilhado com o backend para as rotas OTA
-main/ota_secret.h
+# main/ota_secret.h
